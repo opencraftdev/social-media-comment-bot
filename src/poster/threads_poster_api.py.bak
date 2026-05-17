@@ -1,0 +1,146 @@
+"""Posts replies to Threads via the OFFICIAL Threads Graph API.
+
+Two-step flow (see docs/threads-api-docs/05-create-reply.md):
+  1. POST {user_id}/threads  with media_type=TEXT, text, reply_to_id → creation_id
+  2. POST {user_id}/threads_publish with creation_id → media_id
+  3. GET {media_id}?fields=permalink → reply_url (best-effort)
+
+Auth: long-lived access token in env as `THREADS_ACCESS_TOKEN`. We resolve the
+account user_id via `/me?fields=id` rather than trusting brand-profile or env,
+to keep the token + id in sync.
+
+Return shape:
+    { "reply_platform_id": "<media_id>", "reply_url": "https://..." }
+
+Raises RuntimeError on any non-200 or missing token. No silent swallowing.
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+from typing import Any
+
+import httpx
+
+GRAPH_BASE = "https://graph.threads.net/v1.0"
+# Container processing is usually instant for TEXT but Meta recommends a small pause.
+_PUBLISH_DELAY_SECONDS = 2.0
+_HTTP_TIMEOUT = 30.0
+
+
+def _require_token() -> str:
+    token = os.getenv("THREADS_ACCESS_TOKEN")
+    if not token:
+        raise RuntimeError(
+            "THREADS_ACCESS_TOKEN not set in env. Add it to .env "
+            "(long-lived token for @opencraft.dev)."
+        )
+    return token
+
+
+async def _resolve_user_id(client: httpx.AsyncClient, token: str) -> str:
+    """Query /me to get the authenticated user's id. Don't trust stored ids."""
+    r = await client.get(f"{GRAPH_BASE}/me", params={"fields": "id", "access_token": token})
+    if r.status_code != 200:
+        raise RuntimeError(f"Threads /me failed: HTTP {r.status_code} — {r.text[:300]}")
+    data = r.json()
+    user_id = data.get("id")
+    if not user_id:
+        raise RuntimeError(f"Threads /me returned no id: {data}")
+    return str(user_id)
+
+
+async def _create_container(
+    client: httpx.AsyncClient,
+    user_id: str,
+    token: str,
+    text: str,
+    reply_to_id: str,
+) -> str:
+    r = await client.post(
+        f"{GRAPH_BASE}/{user_id}/threads",
+        data={
+            "media_type": "TEXT",
+            "text": text,
+            "reply_to_id": reply_to_id,
+            "access_token": token,
+        },
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Threads create-container failed: HTTP {r.status_code} — {r.text[:500]}"
+        )
+    data = r.json()
+    creation_id = data.get("id")
+    if not creation_id:
+        raise RuntimeError(f"Threads create-container returned no id: {data}")
+    return str(creation_id)
+
+
+async def _publish(
+    client: httpx.AsyncClient,
+    user_id: str,
+    token: str,
+    creation_id: str,
+) -> str:
+    r = await client.post(
+        f"{GRAPH_BASE}/{user_id}/threads_publish",
+        data={"creation_id": creation_id, "access_token": token},
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"Threads publish failed: HTTP {r.status_code} — {r.text[:500]}"
+        )
+    data = r.json()
+    media_id = data.get("id")
+    if not media_id:
+        raise RuntimeError(f"Threads publish returned no id: {data}")
+    return str(media_id)
+
+
+async def _lookup_permalink(
+    client: httpx.AsyncClient, media_id: str, token: str
+) -> str | None:
+    """Best-effort permalink fetch — never raises, returns None on failure."""
+    try:
+        r = await client.get(
+            f"{GRAPH_BASE}/{media_id}",
+            params={"fields": "permalink", "access_token": token},
+        )
+        if r.status_code == 200:
+            return r.json().get("permalink")
+    except Exception:
+        pass
+    return None
+
+
+async def post_threads_reply(item: dict[str, Any]) -> dict[str, str | None]:
+    """Publish a reply to Threads.
+
+    Args:
+        item: queue row dict — must contain `parent_post_id` and either
+              `final_text` or `draft_text`.
+
+    Returns:
+        { "reply_platform_id": "<media_id>", "reply_url": "https://..." | None }
+
+    Raises:
+        RuntimeError on any platform/HTTP error.
+    """
+    text = item.get("final_text") or item.get("draft_text")
+    parent_id = item.get("parent_post_id")
+    if not text:
+        raise RuntimeError(f"item #{item.get('id')} has no draft_text/final_text")
+    if not parent_id:
+        raise RuntimeError(f"item #{item.get('id')} has no parent_post_id")
+
+    token = _require_token()
+
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        user_id = await _resolve_user_id(client, token)
+        creation_id = await _create_container(client, user_id, token, text, str(parent_id))
+        await asyncio.sleep(_PUBLISH_DELAY_SECONDS)
+        media_id = await _publish(client, user_id, token, creation_id)
+        permalink = await _lookup_permalink(client, media_id, token)
+
+    return {"reply_platform_id": media_id, "reply_url": permalink}
