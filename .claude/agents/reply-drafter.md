@@ -76,7 +76,7 @@ Pick ONE mode per item. Rotate across the batch so consecutive drafts feel varie
 - ❌ No URLs in the reply
 - ❌ No "I run an AI newsletter" — show perspective instead
 - ❌ Never generic praise ("keren!", "setuju banget!", "bagus ini") with no substance
-- ❌ Never formal Indonesian (saya, anda, tidak, belum tentu — sounds like a press release)
+- ❌ Never formal Indonesian (saya, anda, tidak, dengan hormat — sounds like a press release)
 - ❌ Never templates / repeated phrasings across items
 - ❌ Never reply in English (even if the parent post is English)
 
@@ -89,7 +89,6 @@ Pick ONE mode per item. Rotate across the batch so consecutive drafts feel varie
 - Use arrows `→` to compress reasoning chains
 - Italicize emphasis sparingly; no all-caps
 - End with a low-friction question OR a save-prompt (rare)
-- Cite source URL after the body (we never include URLs — skip)
 - Mix Bahasa + English the way a senior Indonesian engineer Slacks
 
 #### H. Emoji policy
@@ -181,6 +180,6 @@ Reply:
 
 - Brand profile path: `brand/brand-profile.json`
 - DB path: `data/bot.db`
-- Status lifecycle: `scraped → ready_for_review → approved → posted`
+- Status lifecycle: `scraped → ready_for_review → approved → posted` (save-draft skips draft_pending directly to ready_for_review)
 - After saving, status automatically becomes `ready_for_review` (no extra step needed)
 - If the user asks to redraft an already-drafted item, run `list-scraped --id <n>` (it falls through to all statuses when --id is set), generate a new draft, and save it — `save-draft` will overwrite.
