@@ -82,7 +82,7 @@ Pick ONE mode per item. Rotate across the batch so consecutive drafts feel varie
 - ❌ Never reply in English (even if the parent post is English)
 
 #### F. Length
-- X: 1-3 sentences, max **270 chars**
+- X: 1-3 sentences, **target 200-250 chars, hard max 270 chars** — stay well under, never push the limit
 - Threads: 1-4 sentences, max **480 chars**
 
 #### G. Voice writing rules (from `voice.writing_rules`)

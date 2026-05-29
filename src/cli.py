@@ -235,7 +235,8 @@ def cmd_save_draft(args) -> int:
         return 1
     max_chars = 270 if item["platform"] == "x" else 480
     if len(text) > max_chars:
-        text = text[: max_chars - 1].rstrip() + "…"
+        print(f"✗ draft too long ({len(text)} chars, max {max_chars}) — regenerate a shorter version")
+        return 1
     save_draft(args.id, args.mode, text)
     print(f"✓ saved draft for #{args.id} (mode={args.mode}, {len(text)} chars)")
     return 0
