@@ -213,22 +213,45 @@ async def post_x_reply(item: dict[str, Any]) -> dict[str, str]:
                 )
 
             # 3. Focus composer (contenteditable) and type the text
-            composer = page.locator("[data-testid='tweetTextarea_0']")
-            try:
-                await composer.wait_for(state="visible", timeout=10000)
-                await composer.click()
-            except PlaywrightTimeout:
-                raise RuntimeError("Reply composer didn't open.")
+            # Try both standard and DraftJS/Lexical composer selectors
+            composer = None
+            for sel in ["[data-testid='tweetTextarea_0']", "[data-testid='tweetTextarea_0RichTextInputContainer']", "[role='textbox']"]:
+                try:
+                    c = page.locator(sel).first
+                    await c.wait_for(state="visible", timeout=5000)
+                    composer = c
+                    break
+                except PlaywrightTimeout:
+                    continue
+            if composer is None:
+                await page.screenshot(path="/tmp/x-post-debug-composer.png", full_page=False)
+                raise RuntimeError("Reply composer didn't open. Screenshot saved to /tmp/x-post-debug-composer.png")
+            await composer.click()
 
             # contenteditable needs keyboard.type, not fill
             await page.keyboard.type(text, delay=15)
 
-            # 4. Submit — use the modal-mode button id, not inline
-            submit_btn = page.locator("button[data-testid='tweetButton']")
-            try:
-                await submit_btn.wait_for(state="visible", timeout=10000)
-            except PlaywrightTimeout:
-                raise RuntimeError("Tweet submit button never appeared.")
+            # 4. Submit — try both modal and inline submit button selectors
+            # X uses 'tweetButton' in modal replies and 'tweetButtonInline' in inline replies
+            submit_btn = None
+            for selector in [
+                "button[data-testid='tweetButton']",
+                "button[data-testid='tweetButtonInline']",
+            ]:
+                try:
+                    btn = page.locator(selector)
+                    await btn.wait_for(state="visible", timeout=5000)
+                    submit_btn = btn
+                    break
+                except PlaywrightTimeout:
+                    continue
+            if submit_btn is None:
+                # Take a debug screenshot before raising
+                await page.screenshot(path="/tmp/x-post-debug-submit.png", full_page=False)
+                raise RuntimeError(
+                    "Tweet submit button never appeared. "
+                    "Screenshot saved to /tmp/x-post-debug-submit.png"
+                )
 
             # 5. Capture CreateTweet network response while clicking
             rest_id = await _grab_create_tweet_id(page, lambda: submit_btn.click())

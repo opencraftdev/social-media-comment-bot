@@ -997,7 +997,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("scrape", help="Scrape viral posts")
     s.add_argument("--platform", choices=["threads", "x", "all"], default="all")
-    s.add_argument("--limit", type=int, default=30)
+    s.add_argument("--limit", type=int, default=3)
     s.add_argument(
         "--lax",
         action="store_true",
