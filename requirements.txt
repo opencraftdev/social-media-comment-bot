@@ -4,3 +4,4 @@ twikit>=2.3.3
 playwright>=1.48.0
 python-dotenv>=1.0.0
 langdetect>=1.0.9
+supabase>=2.0.0

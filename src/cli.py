@@ -985,6 +985,54 @@ def cmd_brand_refresh(args) -> int:
     return 0
 
 
+def cmd_daemon(args) -> int:
+    """Long-lived process that polls Supabase bot_commands and executes them."""
+    import logging
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    init_db()
+
+    def run_scrape(platform: str) -> int:
+        before = len(list_items(status="scraped", limit=1000))
+        scrape_args = argparse.Namespace(platform=platform, limit=3, lax=False)
+        rc = cmd_scrape(scrape_args)
+        if rc != 0:
+            raise RuntimeError(f"scrape failed with code {rc}")
+        after = len(list_items(status="scraped", limit=1000))
+        return max(0, after - before)
+
+    def run_draft(platform: str) -> int:
+        import subprocess
+        from pathlib import Path
+        repo_root = Path(__file__).resolve().parent.parent
+        before = len(list_items(status="ready_for_review", limit=1000))
+        result = subprocess.run(
+            ["claude", "-p", "draft replies", "--dangerously-skip-permissions"],
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"claude agent draft failed with code {result.returncode}")
+        after = len(list_items(status="ready_for_review", limit=1000))
+        return max(0, after - before)
+
+    def run_post_approved(platform: str) -> None:
+        post_args = argparse.Namespace(id=None, all_approved=True)
+        rc = cmd_post(post_args)
+        if rc != 0:
+            raise RuntimeError(f"post failed with code {rc}")
+
+    from src.command_poller import poll_commands
+    poll_commands(
+        run_scrape=run_scrape,
+        run_draft=run_draft,
+        run_post_approved=run_post_approved,
+        interval_s=args.interval,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="src.cli", description="OpenCraft social bot")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1083,6 +1131,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("brand-refresh", help="Re-build brand profile from Zernio")
     s.set_defaults(func=cmd_brand_refresh)
+
+    s = sub.add_parser("daemon", help="Long-lived poller: picks up commands from web UI via Supabase")
+    s.add_argument("--interval", type=int, default=15, help="Poll interval in seconds (default: 15)")
+    s.set_defaults(func=cmd_daemon)
 
     return p
 

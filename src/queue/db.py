@@ -1,189 +1,110 @@
-"""SQLite queue — dedup + audit + approval state."""
+"""Supabase queue — replaces SQLite. Same public API, all writes go to Supabase `replies` table."""
 from __future__ import annotations
 
-import sqlite3
-from datetime import date
-from pathlib import Path
+import os
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parents[2] / "data" / "bot.db"
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS replies (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    platform TEXT NOT NULL,                -- 'threads' | 'x'
-    account_username TEXT NOT NULL,
-    parent_post_id TEXT NOT NULL,
-    parent_post_url TEXT,
-    parent_post_text TEXT,
-    parent_author TEXT,
-    parent_likes INTEGER,
-    parent_replies INTEGER,
-    parent_created_at TIMESTAMP,           -- when the TARGET post was published
-    reply_mode TEXT,                       -- agree_and_extend | polite_contrarian | ...
-    draft_text TEXT,
-    final_text TEXT,
-    reply_platform_id TEXT,                -- ID returned by platform on publish
-    reply_url TEXT,                        -- permalink to the published reply
-    status TEXT NOT NULL DEFAULT 'scraped',
-    error TEXT,
-    note TEXT,
-    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    drafted_at TIMESTAMP,
-    approved_at TIMESTAMP,
-    posted_at TIMESTAMP,
-    UNIQUE(platform, account_username, parent_post_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_replies_status         ON replies(status);
-CREATE INDEX IF NOT EXISTS idx_replies_platform       ON replies(platform);
-CREATE INDEX IF NOT EXISTS idx_replies_posted_at      ON replies(posted_at);
-CREATE INDEX IF NOT EXISTS idx_replies_scraped_at     ON replies(scraped_at);
-"""
+# Kept for backward-compat (cmd_status prints it)
+DB_PATH = "supabase (remote)"
 
 
-def _conn() -> sqlite3.Connection:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    return c
+def _db() -> Client:
+    load_dotenv()
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_ROLE_KEY"])
 
 
-def _ensure_column(c: sqlite3.Connection, table: str, column: str, decl: str) -> None:
-    rows = c.execute(f"PRAGMA table_info('{table}')").fetchall()
-    if not any(r["name"] == column for r in rows):
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+
+def _today_range() -> tuple[str, str]:
+    today = date.today()
+    tomorrow = today + timedelta(days=1)
+    return today.isoformat() + "T00:00:00+00:00", tomorrow.isoformat() + "T00:00:00+00:00"
+
+
+# --------------------------------------------------------------------------- #
+# Schema / init
+# --------------------------------------------------------------------------- #
 
 def init_db() -> None:
-    with _conn() as c:
-        c.executescript(SCHEMA)
-        # Forward-compatible migrations for existing DBs
-        _ensure_column(c, "replies", "parent_created_at", "TIMESTAMP")
-        _ensure_column(c, "replies", "reply_url", "TEXT")
+    """No-op — table is managed in Supabase dashboard."""
+    pass
 
+
+# --------------------------------------------------------------------------- #
+# Queries
+# --------------------------------------------------------------------------- #
 
 def list_items(
     status: str | None = None,
     platform: str = "all",
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    q = "SELECT * FROM replies WHERE 1=1"
-    args: list[Any] = []
+    q = _db().from_("replies").select("*")
     if status:
-        q += " AND status = ?"
-        args.append(status)
+        q = q.eq("status", status)
     if platform and platform != "all":
-        q += " AND platform = ?"
-        args.append(platform)
-    q += " ORDER BY id DESC LIMIT ?"
-    args.append(limit)
-
-    with _conn() as c:
-        rows = c.execute(q, args).fetchall()
-    return [dict(r) for r in rows]
+        q = q.eq("platform", platform)
+    res = q.order("id", desc=True).limit(limit).execute()
+    return res.data or []
 
 
 def count_today(platform: str | None = None, status: str | None = None) -> int:
-    today = date.today().isoformat()
-    q = "SELECT COUNT(*) AS n FROM replies WHERE date(posted_at) = ?" if status == "posted" \
-        else "SELECT COUNT(*) AS n FROM replies WHERE 1=1"
-    args: list[Any] = [today] if status == "posted" else []
-    if status and status != "posted":
-        q += " AND status = ?"
-        args.append(status)
+    start, end = _today_range()
+    q = _db().from_("replies").select("*", count="exact")
+    if status == "posted":
+        q = q.gte("posted_at", start).lt("posted_at", end)
+    elif status:
+        q = q.eq("status", status)
     if platform and platform != "all":
-        q += " AND platform = ?"
-        args.append(platform)
-
-    with _conn() as c:
-        row = c.execute(q, args).fetchone()
-    return row["n"] if row else 0
-
-
-def set_status(item_id: int, new_status: str, note: str | None = None) -> None:
-    ts_col = {
-        "approved": "approved_at",
-        "posted": "posted_at",
-        "ready_for_review": "drafted_at",
-    }.get(new_status)
-    fields = ["status = ?"]
-    args: list[Any] = [new_status]
-    if ts_col:
-        fields.append(f"{ts_col} = CURRENT_TIMESTAMP")
-    if note is not None:
-        fields.append("note = ?")
-        args.append(note)
-    args.append(item_id)
-    with _conn() as c:
-        c.execute(f"UPDATE replies SET {', '.join(fields)} WHERE id = ?", args)
-
-
-def save_draft(item_id: int, reply_mode: str, draft_text: str) -> None:
-    """Persist a generated draft and advance status to ready_for_review."""
-    with _conn() as c:
-        c.execute(
-            "UPDATE replies SET reply_mode = ?, draft_text = ?, "
-            "status = 'ready_for_review', drafted_at = CURRENT_TIMESTAMP, "
-            "error = NULL WHERE id = ?",
-            (reply_mode, draft_text, item_id),
-        )
-
-
-def mark_draft_failed(item_id: int, error: str) -> None:
-    with _conn() as c:
-        c.execute(
-            "UPDATE replies SET status = 'failed', error = ? WHERE id = ?",
-            (f"draft: {error[:300]}", item_id),
-        )
+        q = q.eq("platform", platform)
+    res = q.execute()
+    return res.count or 0
 
 
 def get_item(item_id: int) -> dict[str, Any] | None:
-    with _conn() as c:
-        row = c.execute("SELECT * FROM replies WHERE id = ?", (item_id,)).fetchone()
-    return dict(row) if row else None
-
-
-def mark_posted(
-    item_id: int,
-    reply_platform_id: str,
-    reply_url: str | None = None,
-    final_text: str | None = None,
-) -> None:
-    """Persist a successful publish: status=posted, ids/url + posted_at."""
-    fields = [
-        "status = 'posted'",
-        "reply_platform_id = ?",
-        "reply_url = ?",
-        "posted_at = CURRENT_TIMESTAMP",
-        "error = NULL",
-    ]
-    args: list[Any] = [reply_platform_id, reply_url]
-    if final_text is not None:
-        fields.append("final_text = ?")
-        args.append(final_text)
-    args.append(item_id)
-    with _conn() as c:
-        c.execute(f"UPDATE replies SET {', '.join(fields)} WHERE id = ?", args)
-
-
-def mark_post_failed(item_id: int, error: str) -> None:
-    with _conn() as c:
-        c.execute(
-            "UPDATE replies SET status = 'failed', error = ? WHERE id = ?",
-            (f"post: {error[:500]}", item_id),
-        )
+    res = _db().from_("replies").select("*").eq("id", item_id).limit(1).execute()
+    return res.data[0] if res.data else None
 
 
 def has_replied(platform: str, account: str, parent_post_id: str) -> bool:
-    with _conn() as c:
-        row = c.execute(
-            "SELECT 1 FROM replies WHERE platform = ? AND account_username = ? "
-            "AND parent_post_id = ? AND status IN ('posted', 'approved')",
-            (platform, account, parent_post_id),
-        ).fetchone()
-    return row is not None
+    res = (
+        _db().from_("replies")
+        .select("id", count="exact")
+        .eq("platform", platform)
+        .eq("account_username", account)
+        .eq("parent_post_id", parent_post_id)
+        .in_("status", ["posted", "approved"])
+        .execute()
+    )
+    return (res.count or 0) > 0
 
+
+def last_scrape_at(platform: str | None = None) -> str | None:
+    q = _db().from_("replies").select("scraped_at")
+    if platform:
+        q = q.eq("platform", platform)
+    res = q.order("scraped_at", desc=True).limit(1).execute()
+    return res.data[0]["scraped_at"] if res.data else None
+
+
+def queue_counts() -> dict[tuple[str, str], int]:
+    res = _db().from_("replies").select("platform,status").execute()
+    counts: dict[tuple[str, str], int] = {}
+    for row in (res.data or []):
+        key = (row["platform"], row["status"])
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+# --------------------------------------------------------------------------- #
+# Writes
+# --------------------------------------------------------------------------- #
 
 def insert_scraped(
     platform: str,
@@ -197,57 +118,86 @@ def insert_scraped(
     parent_created_at: Any = None,
     note: str | None = None,
 ) -> int | None:
-    """Insert a freshly scraped post with status='scraped'.
-
-    Returns the inserted row id, or None if a duplicate exists for this
-    (platform, account, post_id) — dedup is enforced by the UNIQUE index.
-    """
+    """Insert a freshly scraped post. Returns row id, or None on duplicate."""
     if parent_created_at is not None and hasattr(parent_created_at, "isoformat"):
         parent_created_at = parent_created_at.isoformat()
 
-    with _conn() as c:
-        try:
-            cur = c.execute(
-                """
-                INSERT INTO replies (
-                    platform, account_username, parent_post_id, parent_post_url,
-                    parent_post_text, parent_author, parent_likes, parent_replies,
-                    parent_created_at, status, note
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'scraped', ?)
-                """,
-                (
-                    platform,
-                    account_username,
-                    parent_post_id,
-                    parent_post_url,
-                    parent_post_text,
-                    parent_author,
-                    parent_likes,
-                    parent_replies,
-                    parent_created_at,
-                    note,
-                ),
-            )
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
-            return None
+    row = {
+        "platform": platform,
+        "account_username": account_username,
+        "parent_post_id": parent_post_id,
+        "parent_post_url": parent_post_url,
+        "parent_post_text": parent_post_text,
+        "parent_author": parent_author,
+        "parent_likes": parent_likes,
+        "parent_replies": parent_replies,
+        "parent_created_at": parent_created_at,
+        "status": "scraped",
+        "note": note,
+        "scraped_at": _now(),
+    }
+
+    res = (
+        _db().from_("replies")
+        .upsert(row, on_conflict="platform,account_username,parent_post_id", ignore_duplicates=True)
+        .execute()
+    )
+    # Returns data only on insert (not on ignored duplicate)
+    return res.data[0]["id"] if res.data else None
 
 
-def last_scrape_at(platform: str | None = None) -> str | None:
-    """Most recent scraped_at timestamp."""
-    q = "SELECT MAX(scraped_at) AS ts FROM replies"
-    args: list[Any] = []
-    if platform:
-        q += " WHERE platform = ?"
-        args.append(platform)
-    with _conn() as c:
-        row = c.execute(q, args).fetchone()
-    return row["ts"] if row and row["ts"] else None
+def set_status(item_id: int, new_status: str, note: str | None = None) -> None:
+    ts_map = {
+        "approved": "approved_at",
+        "posted": "posted_at",
+        "ready_for_review": "drafted_at",
+    }
+    update: dict[str, Any] = {"status": new_status}
+    ts_col = ts_map.get(new_status)
+    if ts_col:
+        update[ts_col] = _now()
+    if note is not None:
+        update["note"] = note
+    _db().from_("replies").update(update).eq("id", item_id).execute()
 
 
-def queue_counts() -> dict[tuple[str, str], int]:
-    with _conn() as c:
-        rows = c.execute(
-            "SELECT platform, status, COUNT(*) AS n FROM replies GROUP BY platform, status"
-        ).fetchall()
-    return {(r["platform"], r["status"]): r["n"] for r in rows}
+def save_draft(item_id: int, reply_mode: str, draft_text: str) -> None:
+    _db().from_("replies").update({
+        "reply_mode": reply_mode,
+        "draft_text": draft_text,
+        "status": "ready_for_review",
+        "drafted_at": _now(),
+        "error": None,
+    }).eq("id", item_id).execute()
+
+
+def mark_draft_failed(item_id: int, error: str) -> None:
+    _db().from_("replies").update({
+        "status": "failed",
+        "error": f"draft: {error[:300]}",
+    }).eq("id", item_id).execute()
+
+
+def mark_posted(
+    item_id: int,
+    reply_platform_id: str,
+    reply_url: str | None = None,
+    final_text: str | None = None,
+) -> None:
+    update: dict[str, Any] = {
+        "status": "posted",
+        "reply_platform_id": reply_platform_id,
+        "reply_url": reply_url,
+        "posted_at": _now(),
+        "error": None,
+    }
+    if final_text is not None:
+        update["final_text"] = final_text
+    _db().from_("replies").update(update).eq("id", item_id).execute()
+
+
+def mark_post_failed(item_id: int, error: str) -> None:
+    _db().from_("replies").update({
+        "status": "failed",
+        "error": f"post: {error[:500]}",
+    }).eq("id", item_id).execute()
