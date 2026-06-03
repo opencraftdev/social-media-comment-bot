@@ -231,7 +231,7 @@ async def scrape_x_viral(brand: dict, limit: int = 30) -> list[ScrapedPost]:
     steel_api_key = os.environ.get("STEEL_API_KEY")
     if steel_api_key:
         steel_client = steel_sdk.Steel(steel_api_key=steel_api_key)
-        session = steel_client.sessions.create()
+        session = steel_client.sessions.create(timeout=900_000)  # 15 min
         try:
             async with async_playwright() as pw:
                 browser = await pw.chromium.connect_over_cdp(

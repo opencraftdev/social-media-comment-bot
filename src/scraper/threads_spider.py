@@ -1,12 +1,13 @@
 """Threads scraper using Playwright + Steel remote browser.
 
 Firecrawl does not support threads.net, so we use Steel (cloud CDP) with the
-same Playwright-based scraping logic as before. Falls back to local Playwright
-if STEEL_API_KEY is not set (for local dev without Steel credentials).
+same Playwright-based scraping logic. Falls back to local Playwright if
+STEEL_API_KEY is not set (for local dev without Steel credentials).
 
 Strategy:
-  1. Per keyword: open Threads search page, collect post permalinks
-  2. Hydrate each post: open post page, extract text + engagement
+  1. Per keyword: open Threads search page (logged-in), collect post permalinks
+  2. Hydrate each post in the same browser session: open post page, extract
+     text + engagement from rendered DOM
   3. Apply brand filters and return keepers
 
 Env vars:
@@ -15,11 +16,13 @@ Env vars:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import steel as steel_sdk
@@ -34,10 +37,15 @@ from playwright.async_api import (
 from src.scraper.filters import passes_brand_filters
 
 
+ACCOUNTS_DIR = Path(__file__).resolve().parents[2] / "accounts"
+
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Steel session lifetime in ms — 15 minutes to cover all keywords + hydration.
+_STEEL_SESSION_TIMEOUT_MS = 900_000
 
 
 @dataclass
@@ -55,6 +63,10 @@ class ScrapedPost:
 
 
 _REL_TIME_RE = re.compile(r"(\d+)\s*([smhdwy])", re.I)
+_BARE_NUM_RE = re.compile(r"^[\d]+(?:[.,]\d+)?\s*[KMkm]?$")
+_TIME_LINE_RE = re.compile(
+    r"^(?:\d+\s*[smhdy]|\d{1,2}/\d{1,2}/\d{2,4}|just now|edited|translate)$", re.I
+)
 
 
 def _parse_relative_time(s: str) -> datetime | None:
@@ -124,13 +136,41 @@ def _parse_count(text: str | None) -> int:
     return int(num)
 
 
-async def _setup_context(browser: Browser) -> BrowserContext:
-    return await browser.new_context(
+def _to_playwright_cookies(flat: dict[str, str]) -> list[dict]:
+    """Mirror cookies across threads.net / instagram.com / threads.com."""
+    out: list[dict] = []
+    for name, value in flat.items():
+        for domain in (".threads.net", ".instagram.com", ".threads.com"):
+            out.append({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+                "secure": True,
+                "httpOnly": name in {"sessionid", "csrftoken"},
+                "sameSite": "Lax",
+            })
+    return out
+
+
+def _load_threads_cookies(username: str) -> dict | None:
+    path = ACCOUNTS_DIR / f"threads_{username}.cookies.json"
+    if not path.exists():
+        return None
+    with path.open() as f:
+        return json.load(f)
+
+
+async def _make_context(browser: Browser, cookies: dict | None) -> BrowserContext:
+    ctx = await browser.new_context(
         user_agent=USER_AGENT,
         viewport={"width": 1280, "height": 900},
         locale="en-US",
         device_scale_factor=2,
     )
+    if cookies:
+        await ctx.add_cookies(_to_playwright_cookies(cookies))
+    return ctx
 
 
 async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
@@ -182,11 +222,6 @@ async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
         body_lines: list[str] = []
         trailing_nums: list[str] = []
 
-        _BARE_NUM_RE = re.compile(r"^[\d]+(?:[.,]\d+)?\s*[KMkm]?$")
-        _TIME_LINE_RE = re.compile(
-            r"^(?:\d+\s*[smhdy]|\d{1,2}/\d{1,2}/\d{2,4}|just now|edited|translate)$", re.I
-        )
-
         for ln in lines:
             if ln.lower() == post.parent_author.lower():
                 continue
@@ -231,7 +266,7 @@ async def _scrape_one_keyword(page: Page, keyword: str, limit: int) -> list[Scra
     except PlaywrightTimeout:
         body_text = (await page.content())[:600].lower()
         if "log in" in body_text or "sign up" in body_text:
-            print(f"  [!] login wall for '{keyword}' — skipping")
+            print(f"  [!] login wall for '{keyword}' — cookies may be expired")
         else:
             print(f"  [!] no post links rendered for '{keyword}'")
         return posts
@@ -309,74 +344,53 @@ async def _scrape_one_keyword(page: Page, keyword: str, limit: int) -> list[Scra
     return posts
 
 
-async def _run_with_browser(browser: Browser, brand: dict, limit: int) -> list[ScrapedPost]:
-    """Core scraping logic shared by Steel and local Playwright paths."""
+async def _run_with_browser(
+    browser: Browser, brand: dict, limit: int, cookies: dict | None
+) -> list[ScrapedPost]:
+    """Core scraping logic: search phase then hydration phase, same browser session."""
     keywords = brand["viral_post_filters"]["monitor_keywords"]
     per_kw_limit = max(3, limit // max(1, len(keywords)))
 
     all_posts: list[ScrapedPost] = []
     seen_ids: set[str] = set()
 
-    ctx = await _setup_context(browser)
-    page = await ctx.new_page()
+    # Single context with cookies for both phases
+    ctx = await _make_context(browser, cookies)
+
     try:
-        for kw in keywords:
-            print(f"  · keyword: {kw}")
-            results = await _scrape_one_keyword(page, kw, per_kw_limit)
+        # Phase 1: collect post permalinks via search pages
+        page = await ctx.new_page()
+        try:
+            for kw in keywords:
+                print(f"  · keyword: {kw}")
+                results = await _scrape_one_keyword(page, kw, per_kw_limit)
 
-            for p in results:
-                if p.parent_post_id in seen_ids:
-                    continue
-                seen_ids.add(p.parent_post_id)
-                all_posts.append(p)
+                for p in results:
+                    if p.parent_post_id in seen_ids:
+                        continue
+                    seen_ids.add(p.parent_post_id)
+                    all_posts.append(p)
 
-            await asyncio.sleep(random.uniform(2.0, 4.0))
+                await asyncio.sleep(random.uniform(2.0, 4.0))
 
-            if len(all_posts) >= limit:
-                break
+                if len(all_posts) >= limit:
+                    break
+        finally:
+            await page.close()
+
+        # Phase 2: hydrate each post page (text + timestamps) — same context, 2 tabs
+        if all_posts:
+            print(f"  · hydrating {len(all_posts)} posts…")
+            sem = asyncio.Semaphore(2)
+
+            async def _bound(p: ScrapedPost) -> None:
+                async with sem:
+                    await _hydrate_post(ctx, p)
+
+            await asyncio.gather(*(_bound(p) for p in all_posts))
+
     finally:
         await ctx.close()
-
-    # Hydrate: open each post page to extract full text + timestamps
-    if all_posts:
-        print(f"  · hydrating {len(all_posts)} posts…")
-        async with async_playwright() as pw2:
-            if os.environ.get("STEEL_API_KEY"):
-                hydrate_api_key = os.environ["STEEL_API_KEY"]
-                steel_client = steel_sdk.Steel(steel_api_key=hydrate_api_key)
-                session = steel_client.sessions.create()
-                try:
-                    b2 = await pw2.chromium.connect_over_cdp(
-                        f"wss://connect.steel.dev?apiKey={hydrate_api_key}&sessionId={session.id}"
-                    )
-                    ctx2 = await _setup_context(b2)
-                    try:
-                        sem = asyncio.Semaphore(2)
-
-                        async def _bound(p: ScrapedPost) -> None:
-                            async with sem:
-                                await _hydrate_post(ctx2, p)
-
-                        await asyncio.gather(*(_bound(p) for p in all_posts))
-                    finally:
-                        await ctx2.close()
-                        await b2.close()
-                finally:
-                    steel_client.sessions.release(session.id)
-            else:
-                b2 = await pw2.chromium.launch(headless=True)
-                ctx2 = await _setup_context(b2)
-                try:
-                    sem = asyncio.Semaphore(2)
-
-                    async def _bound(p: ScrapedPost) -> None:
-                        async with sem:
-                            await _hydrate_post(ctx2, p)
-
-                    await asyncio.gather(*(_bound(p) for p in all_posts))
-                finally:
-                    await ctx2.close()
-                    await b2.close()
 
     return all_posts
 
@@ -388,23 +402,27 @@ async def scrape_threads_viral(brand: dict, limit: int = 30) -> list[ScrapedPost
     to local Playwright (for dev without Steel credentials).
     """
     steel_api_key = os.environ.get("STEEL_API_KEY")
+    username = brand["accounts"]["threads"]["username"]
+    cookies = _load_threads_cookies(username)
+    if not cookies:
+        print("  [!] No Threads cookies found — scraping without auth (may hit login wall)")
 
     if steel_api_key:
         steel_client = steel_sdk.Steel(steel_api_key=steel_api_key)
-        session = steel_client.sessions.create()
+        session = steel_client.sessions.create(timeout=_STEEL_SESSION_TIMEOUT_MS)
         try:
             async with async_playwright() as pw:
                 browser = await pw.chromium.connect_over_cdp(
                     f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
                 )
-                all_posts = await _run_with_browser(browser, brand, limit)
+                all_posts = await _run_with_browser(browser, brand, limit, cookies)
                 await browser.close()
         finally:
             steel_client.sessions.release(session.id)
     else:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
-            all_posts = await _run_with_browser(browser, brand, limit)
+            all_posts = await _run_with_browser(browser, brand, limit, cookies)
             await browser.close()
 
     # Apply brand filters
