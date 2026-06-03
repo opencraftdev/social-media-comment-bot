@@ -349,7 +349,9 @@ async def _run_with_browser(
 ) -> list[ScrapedPost]:
     """Core scraping logic: search phase then hydration phase, same browser session."""
     keywords = brand["viral_post_filters"]["monitor_keywords"]
-    per_kw_limit = max(3, limit // max(1, len(keywords)))
+    # Collect 3x the final limit so language/engagement filtering has a full pool to work with.
+    raw_target = max(limit * 3, 15)
+    per_kw_limit = max(3, raw_target // max(1, len(keywords)))
 
     all_posts: list[ScrapedPost] = []
     seen_ids: set[str] = set()
@@ -373,7 +375,7 @@ async def _run_with_browser(
 
                 await asyncio.sleep(random.uniform(2.0, 4.0))
 
-                if len(all_posts) >= limit:
+                if len(all_posts) >= raw_target:
                     break
         finally:
             await page.close()
