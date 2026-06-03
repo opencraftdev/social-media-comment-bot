@@ -234,7 +234,9 @@ async def scrape_x_viral(brand: dict, limit: int = 30) -> list[ScrapedPost]:
         session = steel_client.sessions.create()
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.connect_over_cdp(session.websocket_url)
+                browser = await pw.chromium.connect_over_cdp(
+                    f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
+                )
                 ctx = await browser.new_context(
                     user_agent=USER_AGENT,
                     viewport={"width": 1280, "height": 900},

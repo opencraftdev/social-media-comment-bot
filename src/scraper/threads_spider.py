@@ -342,10 +342,13 @@ async def _run_with_browser(browser: Browser, brand: dict, limit: int) -> list[S
         print(f"  · hydrating {len(all_posts)} posts…")
         async with async_playwright() as pw2:
             if os.environ.get("STEEL_API_KEY"):
-                steel_client = steel_sdk.Steel(steel_api_key=os.environ["STEEL_API_KEY"])
+                hydrate_api_key = os.environ["STEEL_API_KEY"]
+                steel_client = steel_sdk.Steel(steel_api_key=hydrate_api_key)
                 session = steel_client.sessions.create()
                 try:
-                    b2 = await pw2.chromium.connect_over_cdp(session.websocket_url)
+                    b2 = await pw2.chromium.connect_over_cdp(
+                        f"wss://connect.steel.dev?apiKey={hydrate_api_key}&sessionId={session.id}"
+                    )
                     ctx2 = await _setup_context(b2)
                     try:
                         sem = asyncio.Semaphore(2)
@@ -391,7 +394,9 @@ async def scrape_threads_viral(brand: dict, limit: int = 30) -> list[ScrapedPost
         session = steel_client.sessions.create()
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.connect_over_cdp(session.websocket_url)
+                browser = await pw.chromium.connect_over_cdp(
+                    f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
+                )
                 all_posts = await _run_with_browser(browser, brand, limit)
                 await browser.close()
         finally:

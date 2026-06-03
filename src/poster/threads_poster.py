@@ -502,7 +502,9 @@ async def post_threads_reply(item: dict[str, Any]) -> dict[str, str | None]:
         session = steel_client.sessions.create()
         try:
             async with async_playwright() as pw:
-                browser = await pw.chromium.connect_over_cdp(session.websocket_url)
+                browser = await pw.chromium.connect_over_cdp(
+                    f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
+                )
                 ctx = await _new_logged_in_context_from_browser(browser, cookies)
                 try:
                     page = await ctx.new_page()
