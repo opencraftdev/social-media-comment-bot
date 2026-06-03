@@ -46,6 +46,8 @@ from playwright.async_api import (
     async_playwright,
 )
 
+import steel as steel_sdk
+
 from src.brand.loader import load_brand_profile
 
 ACCOUNTS_DIR = Path(__file__).resolve().parents[2] / "accounts"
@@ -443,6 +445,18 @@ async def _verify_reply_on_parent(
 # Public entry point
 # ──────────────────────────────────────────────────────────────────────────
 
+async def _new_logged_in_context_from_browser(browser, cookies: dict[str, str]):
+    """Same as _new_logged_in_context but for an already-connected browser (Steel)."""
+    ctx = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 900},
+        locale="en-US",
+    )
+    playwright_cookies = _to_playwright_cookies_threads(cookies)
+    await ctx.add_cookies(playwright_cookies)
+    return ctx
+
+
 async def post_threads_reply(item: dict[str, Any]) -> dict[str, str | None]:
     """Publish a reply to Threads via the web UI.
 
@@ -482,158 +496,322 @@ async def post_threads_reply(item: dict[str, Any]) -> dict[str, str | None]:
     if dry_run:
         _log("DRY-RUN mode active — will abort right before the final Post click")
 
-    async with async_playwright() as pw:
-        browser, ctx = await _new_logged_in_context(pw, cookies)
+    steel_api_key = os.environ.get("STEEL_API_KEY")
+    if steel_api_key:
+        steel_client = steel_sdk.Steel(steel_api_key=steel_api_key)
+        session = steel_client.sessions.create()
         try:
-            page = await ctx.new_page()
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(session.websocket_url)
+                ctx = await _new_logged_in_context_from_browser(browser, cookies)
+                try:
+                    page = await ctx.new_page()
 
-            # ─── Step 1: nav to parent ────────────────────────────────────
-            try:
-                await page.goto(parent_url, wait_until="domcontentloaded", timeout=30000)
-                _log(f"navigated to parent post: {page.url}")
-            except PlaywrightTimeout:
-                raise RuntimeError(f"Timed out loading {parent_url}")
+                    # ─── Step 1: nav to parent ────────────────────────────────────
+                    try:
+                        await page.goto(parent_url, wait_until="domcontentloaded", timeout=30000)
+                        _log(f"navigated to parent post: {page.url}")
+                    except PlaywrightTimeout:
+                        raise RuntimeError(f"Timed out loading {parent_url}")
 
-            if "/login" in page.url:
-                raise RuntimeError(
-                    f"Threads session expired (redirected to {page.url}). "
-                    f"Re-run threads-login."
-                )
+                    if "/login" in page.url:
+                        raise RuntimeError(
+                            f"Threads session expired (redirected to {page.url}). "
+                            f"Re-run threads-login."
+                        )
 
-            try:
-                await page.wait_for_selector(
-                    "article, [data-pressable-container]", timeout=15000
-                )
-            except PlaywrightTimeout:
-                await _shot(page, "00-parent-no-article")
-                raise RuntimeError(
-                    f"Parent post did not render at {parent_url} "
-                    "(deleted/private/blocked?)"
-                )
+                    try:
+                        await page.wait_for_selector(
+                            "article, [data-pressable-container]", timeout=15000
+                        )
+                    except PlaywrightTimeout:
+                        await _shot(page, "00-parent-no-article")
+                        raise RuntimeError(
+                            f"Parent post did not render at {parent_url} "
+                            "(deleted/private/blocked?)"
+                        )
 
-            # Quick parent-post diagnostics
-            try:
-                article_count = await page.locator("article").count()
-                pressable_count = await page.locator("[data-pressable-container]").count()
-                first_author_handle = await page.evaluate(
-                    """() => {
-                        const a = document.querySelector(
-                            "article a[href^='/@'], [data-pressable-container] a[href^='/@'], main a[href^='/@']"
-                        );
-                        return a ? a.getAttribute('href') : null;
-                    }"""
-                )
-                _log(
-                    f"found {article_count} article(s) / {pressable_count} pressable container(s); "
-                    f"first author href = {first_author_handle}"
-                )
-            except Exception as e:  # noqa: BLE001
-                _log(f"parent-post diagnostics failed: {e}")
+                    # Quick parent-post diagnostics
+                    try:
+                        article_count = await page.locator("article").count()
+                        pressable_count = await page.locator("[data-pressable-container]").count()
+                        first_author_handle = await page.evaluate(
+                            """() => {
+                                const a = document.querySelector(
+                                    "article a[href^='/@'], [data-pressable-container] a[href^='/@'], main a[href^='/@']"
+                                );
+                                return a ? a.getAttribute('href') : null;
+                            }"""
+                        )
+                        _log(
+                            f"found {article_count} article(s) / {pressable_count} pressable container(s); "
+                            f"first author href = {first_author_handle}"
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        _log(f"parent-post diagnostics failed: {e}")
 
-            await _shot(page, "01-parent-loaded")
+                    await _shot(page, "01-parent-loaded")
 
-            # ─── Step 2: open reply composer ──────────────────────────────
-            try:
-                reply_selector = await _click_reply_button(page)
-            except Exception as e:
-                await _shot(page, "02-reply-click-failed")
-                raise RuntimeError(f"reply button click failed: {e}") from e
+                    # ─── Step 2: open reply composer ──────────────────────────────
+                    try:
+                        reply_selector = await _click_reply_button(page)
+                    except Exception as e:
+                        await _shot(page, "02-reply-click-failed")
+                        raise RuntimeError(f"reply button click failed: {e}") from e
 
-            # ─── Step 3: focus composer + type ────────────────────────────
-            try:
-                composer_loc, composer_sel = await _focus_composer(page)
-            except Exception as e:
-                await _shot(page, "03-composer-not-found")
-                raise RuntimeError(f"composer locate/focus failed: {e}") from e
+                    # ─── Step 3: focus composer + type ────────────────────────────
+                    try:
+                        composer_loc, composer_sel = await _focus_composer(page)
+                    except Exception as e:
+                        await _shot(page, "03-composer-not-found")
+                        raise RuntimeError(f"composer locate/focus failed: {e}") from e
 
-            await _shot(page, "03-composer-open")
+                    await _shot(page, "03-composer-open")
 
-            await page.keyboard.type(text, delay=15)
-            await asyncio.sleep(0.4)
-            length_after = await _composer_text_length(page)
-            _log(
-                f"composer focused via {composer_sel}; "
-                f"typed {len(text)} chars; innerText length now = {length_after}"
-            )
-            await _shot(page, "04-after-typing")
+                    await page.keyboard.type(text, delay=15)
+                    await asyncio.sleep(0.4)
+                    length_after = await _composer_text_length(page)
+                    _log(
+                        f"composer focused via {composer_sel}; "
+                        f"typed {len(text)} chars; innerText length now = {length_after}"
+                    )
+                    await _shot(page, "04-after-typing")
 
-            # ─── Step 4: locate Post button, wait for enabled ─────────────
-            try:
-                post_btn, post_sel = await _find_post_button(page)
-            except Exception as e:
-                await _shot(page, "05-post-btn-missing")
-                raise RuntimeError(f"post button not found: {e}") from e
+                    # ─── Step 4: locate Post button, wait for enabled ─────────────
+                    try:
+                        post_btn, post_sel = await _find_post_button(page)
+                    except Exception as e:
+                        await _shot(page, "05-post-btn-missing")
+                        raise RuntimeError(f"post button not found: {e}") from e
 
-            enabled = await _wait_enabled(post_btn, total_ms=6000)
-            try:
-                aria_dis = await post_btn.get_attribute("aria-disabled")
-            except Exception:
-                aria_dis = "?"
-            _log(
-                f"post button located via {post_sel}; "
-                f"aria-disabled={aria_dis}; enabled_after_wait={enabled}"
-            )
-            await _shot(page, "05-before-submit")
+                    enabled = await _wait_enabled(post_btn, total_ms=6000)
+                    try:
+                        aria_dis = await post_btn.get_attribute("aria-disabled")
+                    except Exception:
+                        aria_dis = "?"
+                    _log(
+                        f"post button located via {post_sel}; "
+                        f"aria-disabled={aria_dis}; enabled_after_wait={enabled}"
+                    )
+                    await _shot(page, "05-before-submit")
 
-            if not enabled:
-                raise RuntimeError(
-                    "Post button never became enabled (aria-disabled stayed true)."
-                )
+                    if not enabled:
+                        raise RuntimeError(
+                            "Post button never became enabled (aria-disabled stayed true)."
+                        )
 
-            # ─── DRY-RUN abort hook ───────────────────────────────────────
-            if dry_run:
-                _log("DRY-RUN: aborting before final Post click")
-                await _shot(page, "06-dryrun-abort")
-                raise RuntimeError("dry-run: aborting before submit")
+                    # ─── DRY-RUN abort hook ───────────────────────────────────────
+                    if dry_run:
+                        _log("DRY-RUN: aborting before final Post click")
+                        await _shot(page, "06-dryrun-abort")
+                        raise RuntimeError("dry-run: aborting before submit")
 
-            # ─── Step 5: click Post while watching network ────────────────
-            _log("post button clicked, waiting for response/navigation")
-            shortcode, pk, resp_snip = await _grab_create_response(
-                page, lambda: post_btn.click()
-            )
+                    # ─── Step 5: click Post while watching network ────────────────
+                    _log("post button clicked, waiting for response/navigation")
+                    shortcode, pk, resp_snip = await _grab_create_response(
+                        page, lambda: post_btn.click()
+                    )
 
-            # Snapshot post-submit state
-            try:
-                await asyncio.sleep(1.5)
-                await _shot(page, "07-after-submit")
-                _log(f"post-submit URL: {page.url}")
-            except Exception:
-                pass
+                    # Snapshot post-submit state
+                    try:
+                        await asyncio.sleep(1.5)
+                        await _shot(page, "07-after-submit")
+                        _log(f"post-submit URL: {page.url}")
+                    except Exception:
+                        pass
 
-            # ─── Step 6: VERIFY on the parent post ────────────────────────
-            verified_url = await _verify_reply_on_parent(
-                page, parent_url, our_username, timeout_s=15.0
-            )
-            await _shot(page, "08-verify-parent")
+                    # ─── Step 6: VERIFY on the parent post ────────────────────────
+                    verified_url = await _verify_reply_on_parent(
+                        page, parent_url, our_username, timeout_s=15.0
+                    )
+                    await _shot(page, "08-verify-parent")
 
-            if not verified_url:
-                # Hard fail — no stale-profile fallback as "proof".
-                raise RuntimeError(
-                    "post not visible on parent post within 15s "
-                    f"(network_hint={resp_snip!r}, graphql_shortcode={shortcode!r}, "
-                    f"graphql_pk={pk!r})"
-                )
+                    if not verified_url:
+                        # Hard fail — no stale-profile fallback as "proof".
+                        raise RuntimeError(
+                            "post not visible on parent post within 15s "
+                            f"(network_hint={resp_snip!r}, graphql_shortcode={shortcode!r}, "
+                            f"graphql_pk={pk!r})"
+                        )
 
-            # Extract canonical shortcode from the verified anchor
-            m = _POST_URL_RE.search(verified_url) or _SHORTCODE_RE.search(verified_url)
-            if m:
-                verified_shortcode = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
-            else:
-                verified_shortcode = shortcode or pk
+                    # Extract canonical shortcode from the verified anchor
+                    m = _POST_URL_RE.search(verified_url) or _SHORTCODE_RE.search(verified_url)
+                    if m:
+                        verified_shortcode = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
+                    else:
+                        verified_shortcode = shortcode or pk
 
-            reply_id = verified_shortcode or shortcode or pk
-            if not reply_id:
-                raise RuntimeError(
-                    "verified anchor found but could not parse shortcode from it"
-                )
+                    reply_id = verified_shortcode or shortcode or pk
+                    if not reply_id:
+                        raise RuntimeError(
+                            "verified anchor found but could not parse shortcode from it"
+                        )
 
-            reply_url = (
-                f"https://www.threads.net/@{our_username}/post/{verified_shortcode}"
-                if verified_shortcode
-                else verified_url
-            )
-            _log(f"SUCCESS — verified reply at {reply_url}")
-            return {"reply_platform_id": reply_id, "reply_url": reply_url}
+                    reply_url = (
+                        f"https://www.threads.net/@{our_username}/post/{verified_shortcode}"
+                        if verified_shortcode
+                        else verified_url
+                    )
+                    _log(f"SUCCESS — verified reply at {reply_url}")
+                    return {"reply_platform_id": reply_id, "reply_url": reply_url}
+                finally:
+                    await ctx.close()
+                    await browser.close()
         finally:
-            await ctx.close()
-            await browser.close()
+            steel_client.sessions.release(session.id)
+    else:
+        async with async_playwright() as pw:
+            browser, ctx = await _new_logged_in_context(pw, cookies)
+            try:
+                page = await ctx.new_page()
+
+                # ─── Step 1: nav to parent ────────────────────────────────────
+                try:
+                    await page.goto(parent_url, wait_until="domcontentloaded", timeout=30000)
+                    _log(f"navigated to parent post: {page.url}")
+                except PlaywrightTimeout:
+                    raise RuntimeError(f"Timed out loading {parent_url}")
+
+                if "/login" in page.url:
+                    raise RuntimeError(
+                        f"Threads session expired (redirected to {page.url}). "
+                        f"Re-run threads-login."
+                    )
+
+                try:
+                    await page.wait_for_selector(
+                        "article, [data-pressable-container]", timeout=15000
+                    )
+                except PlaywrightTimeout:
+                    await _shot(page, "00-parent-no-article")
+                    raise RuntimeError(
+                        f"Parent post did not render at {parent_url} "
+                        "(deleted/private/blocked?)"
+                    )
+
+                # Quick parent-post diagnostics
+                try:
+                    article_count = await page.locator("article").count()
+                    pressable_count = await page.locator("[data-pressable-container]").count()
+                    first_author_handle = await page.evaluate(
+                        """() => {
+                            const a = document.querySelector(
+                                "article a[href^='/@'], [data-pressable-container] a[href^='/@'], main a[href^='/@']"
+                            );
+                            return a ? a.getAttribute('href') : null;
+                        }"""
+                    )
+                    _log(
+                        f"found {article_count} article(s) / {pressable_count} pressable container(s); "
+                        f"first author href = {first_author_handle}"
+                    )
+                except Exception as e:  # noqa: BLE001
+                    _log(f"parent-post diagnostics failed: {e}")
+
+                await _shot(page, "01-parent-loaded")
+
+                # ─── Step 2: open reply composer ──────────────────────────────
+                try:
+                    reply_selector = await _click_reply_button(page)
+                except Exception as e:
+                    await _shot(page, "02-reply-click-failed")
+                    raise RuntimeError(f"reply button click failed: {e}") from e
+
+                # ─── Step 3: focus composer + type ────────────────────────────
+                try:
+                    composer_loc, composer_sel = await _focus_composer(page)
+                except Exception as e:
+                    await _shot(page, "03-composer-not-found")
+                    raise RuntimeError(f"composer locate/focus failed: {e}") from e
+
+                await _shot(page, "03-composer-open")
+
+                await page.keyboard.type(text, delay=15)
+                await asyncio.sleep(0.4)
+                length_after = await _composer_text_length(page)
+                _log(
+                    f"composer focused via {composer_sel}; "
+                    f"typed {len(text)} chars; innerText length now = {length_after}"
+                )
+                await _shot(page, "04-after-typing")
+
+                # ─── Step 4: locate Post button, wait for enabled ─────────────
+                try:
+                    post_btn, post_sel = await _find_post_button(page)
+                except Exception as e:
+                    await _shot(page, "05-post-btn-missing")
+                    raise RuntimeError(f"post button not found: {e}") from e
+
+                enabled = await _wait_enabled(post_btn, total_ms=6000)
+                try:
+                    aria_dis = await post_btn.get_attribute("aria-disabled")
+                except Exception:
+                    aria_dis = "?"
+                _log(
+                    f"post button located via {post_sel}; "
+                    f"aria-disabled={aria_dis}; enabled_after_wait={enabled}"
+                )
+                await _shot(page, "05-before-submit")
+
+                if not enabled:
+                    raise RuntimeError(
+                        "Post button never became enabled (aria-disabled stayed true)."
+                    )
+
+                # ─── DRY-RUN abort hook ───────────────────────────────────────
+                if dry_run:
+                    _log("DRY-RUN: aborting before final Post click")
+                    await _shot(page, "06-dryrun-abort")
+                    raise RuntimeError("dry-run: aborting before submit")
+
+                # ─── Step 5: click Post while watching network ────────────────
+                _log("post button clicked, waiting for response/navigation")
+                shortcode, pk, resp_snip = await _grab_create_response(
+                    page, lambda: post_btn.click()
+                )
+
+                # Snapshot post-submit state
+                try:
+                    await asyncio.sleep(1.5)
+                    await _shot(page, "07-after-submit")
+                    _log(f"post-submit URL: {page.url}")
+                except Exception:
+                    pass
+
+                # ─── Step 6: VERIFY on the parent post ────────────────────────
+                verified_url = await _verify_reply_on_parent(
+                    page, parent_url, our_username, timeout_s=15.0
+                )
+                await _shot(page, "08-verify-parent")
+
+                if not verified_url:
+                    # Hard fail — no stale-profile fallback as "proof".
+                    raise RuntimeError(
+                        "post not visible on parent post within 15s "
+                        f"(network_hint={resp_snip!r}, graphql_shortcode={shortcode!r}, "
+                        f"graphql_pk={pk!r})"
+                    )
+
+                # Extract canonical shortcode from the verified anchor
+                m = _POST_URL_RE.search(verified_url) or _SHORTCODE_RE.search(verified_url)
+                if m:
+                    verified_shortcode = m.group(2) if m.lastindex and m.lastindex >= 2 else m.group(1)
+                else:
+                    verified_shortcode = shortcode or pk
+
+                reply_id = verified_shortcode or shortcode or pk
+                if not reply_id:
+                    raise RuntimeError(
+                        "verified anchor found but could not parse shortcode from it"
+                    )
+
+                reply_url = (
+                    f"https://www.threads.net/@{our_username}/post/{verified_shortcode}"
+                    if verified_shortcode
+                    else verified_url
+                )
+                _log(f"SUCCESS — verified reply at {reply_url}")
+                return {"reply_platform_id": reply_id, "reply_url": reply_url}
+            finally:
+                await ctx.close()
+                await browser.close()
