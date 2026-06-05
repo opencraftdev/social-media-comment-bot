@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
+
+import steel as steel_sdk
 
 from playwright.async_api import (
     async_playwright,
@@ -225,54 +228,113 @@ async def scrape_x_viral(brand: dict, limit: int = 30) -> list[ScrapedPost]:
     # Track sweep label per post so we can preserve ID-priority when ranking
     sweep_index: dict[str, int] = {}
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-            locale="en-US",
-        )
-        await ctx.add_cookies(pw_cookies)
-
-        page = await ctx.new_page()
+    steel_api_key = os.environ.get("STEEL_API_KEY")
+    if steel_api_key:
+        steel_client = steel_sdk.Steel(steel_api_key=steel_api_key)
+        session = steel_client.sessions.create(timeout=900_000)  # 15 min
         try:
-            for sweep_idx, lang_hint in enumerate(lang_pref):
-                if sweep_idx > 0:
-                    cooldown = random.uniform(20.0, 35.0)
-                    print(f"\n  ── cooldown {cooldown:.0f}s before next sweep (avoid X throttle) ──")
-                    await asyncio.sleep(cooldown)
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(
+                    f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
+                )
+                ctx = await browser.new_context(
+                    user_agent=USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                    locale="en-US",
+                )
+                await ctx.add_cookies(pw_cookies)
 
-                tag = f"lang:{lang_hint}" if lang_hint else "(no lang filter)"
-                print(f"\n  ── sweep {sweep_idx + 1}: {tag} ──")
+                page = await ctx.new_page()
+                try:
+                    for sweep_idx, lang_hint in enumerate(lang_pref):
+                        if sweep_idx > 0:
+                            cooldown = random.uniform(20.0, 35.0)
+                            print(f"\n  ── cooldown {cooldown:.0f}s before next sweep (avoid X throttle) ──")
+                            await asyncio.sleep(cooldown)
 
-                # Indonesian sweep also uses ID-extra keywords ('ai untuk developer' etc.)
-                sweep_keywords = keywords + (id_extra if lang_hint == "id" else [])
+                        tag = f"lang:{lang_hint}" if lang_hint else "(no lang filter)"
+                        print(f"\n  ── sweep {sweep_idx + 1}: {tag} ──")
 
-                for kw in sweep_keywords:
-                    if len(all_posts) >= raw_target:
-                        break
-                    print(f"  · keyword: {kw}")
-                    try:
-                        results = await _scrape_search(page, kw, per_kw_limit, lang_hint=lang_hint)
-                    except Exception as e:
-                        print(f"    [!] error: {e.__class__.__name__}: {e}")
-                        results = []
+                        # Indonesian sweep also uses ID-extra keywords ('ai untuk developer' etc.)
+                        sweep_keywords = keywords + (id_extra if lang_hint == "id" else [])
 
-                    new_this_kw = 0
-                    for p in results:
-                        if p.parent_post_id in seen_ids:
-                            continue
-                        seen_ids.add(p.parent_post_id)
-                        sweep_index[p.parent_post_id] = sweep_idx
-                        all_posts.append(p)
-                        new_this_kw += 1
-                    if new_this_kw:
-                        print(f"    + {new_this_kw} new")
+                        for kw in sweep_keywords:
+                            if len(all_posts) >= raw_target:
+                                break
+                            print(f"  · keyword: {kw}")
+                            try:
+                                results = await _scrape_search(page, kw, per_kw_limit, lang_hint=lang_hint)
+                            except Exception as e:
+                                print(f"    [!] error: {e.__class__.__name__}: {e}")
+                                results = []
 
-                    await asyncio.sleep(random.uniform(4.0, 8.0))
+                            new_this_kw = 0
+                            for p in results:
+                                if p.parent_post_id in seen_ids:
+                                    continue
+                                seen_ids.add(p.parent_post_id)
+                                sweep_index[p.parent_post_id] = sweep_idx
+                                all_posts.append(p)
+                                new_this_kw += 1
+                            if new_this_kw:
+                                print(f"    + {new_this_kw} new")
+
+                            await asyncio.sleep(random.uniform(4.0, 8.0))
+                finally:
+                    await ctx.close()
+                    await browser.close()
         finally:
-            await ctx.close()
-            await browser.close()
+            steel_client.sessions.release(session.id)
+    else:
+        # Fallback: local Playwright (dev without Steel key)
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True)
+            ctx = await browser.new_context(
+                user_agent=USER_AGENT,
+                viewport={"width": 1280, "height": 900},
+                locale="en-US",
+            )
+            await ctx.add_cookies(pw_cookies)
+
+            page = await ctx.new_page()
+            try:
+                for sweep_idx, lang_hint in enumerate(lang_pref):
+                    if sweep_idx > 0:
+                        cooldown = random.uniform(20.0, 35.0)
+                        print(f"\n  ── cooldown {cooldown:.0f}s before next sweep (avoid X throttle) ──")
+                        await asyncio.sleep(cooldown)
+
+                    tag = f"lang:{lang_hint}" if lang_hint else "(no lang filter)"
+                    print(f"\n  ── sweep {sweep_idx + 1}: {tag} ──")
+
+                    # Indonesian sweep also uses ID-extra keywords ('ai untuk developer' etc.)
+                    sweep_keywords = keywords + (id_extra if lang_hint == "id" else [])
+
+                    for kw in sweep_keywords:
+                        if len(all_posts) >= raw_target:
+                            break
+                        print(f"  · keyword: {kw}")
+                        try:
+                            results = await _scrape_search(page, kw, per_kw_limit, lang_hint=lang_hint)
+                        except Exception as e:
+                            print(f"    [!] error: {e.__class__.__name__}: {e}")
+                            results = []
+
+                        new_this_kw = 0
+                        for p in results:
+                            if p.parent_post_id in seen_ids:
+                                continue
+                            seen_ids.add(p.parent_post_id)
+                            sweep_index[p.parent_post_id] = sweep_idx
+                            all_posts.append(p)
+                            new_this_kw += 1
+                        if new_this_kw:
+                            print(f"    + {new_this_kw} new")
+
+                        await asyncio.sleep(random.uniform(4.0, 8.0))
+            finally:
+                await ctx.close()
+                await browser.close()
 
     # Apply brand filters (self-skip + the rest)
     kept: list[ScrapedPost] = []

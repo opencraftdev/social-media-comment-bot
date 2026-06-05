@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
+
+import steel as steel_sdk
 
 from playwright.async_api import (
     BrowserContext,
@@ -66,6 +69,18 @@ async def _new_logged_in_context(pw, cookies: dict[str, str]) -> tuple[Any, Brow
     )
     await ctx.add_cookies(_to_playwright_cookies(cookies))
     return browser, ctx
+
+
+async def _new_logged_in_context_from_browser(browser, cookies: dict[str, str]):
+    """Same as _new_logged_in_context but for an already-connected browser (Steel)."""
+    ctx = await browser.new_context(
+        user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        viewport={"width": 1280, "height": 900},
+        locale="en-US",
+    )
+    playwright_cookies = _to_playwright_cookies(cookies)
+    await ctx.add_cookies(playwright_cookies)
+    return ctx
 
 
 async def _grab_create_tweet_id(page: Page, click_submit) -> str | None:
@@ -180,94 +195,195 @@ async def post_x_reply(item: dict[str, Any]) -> dict[str, str]:
 
     tweet_url = _build_tweet_url(parent_author, str(parent_id))
 
-    async with async_playwright() as pw:
-        browser, ctx = await _new_logged_in_context(pw, cookies)
+    steel_api_key = os.environ.get("STEEL_API_KEY")
+    if steel_api_key:
+        steel_client = steel_sdk.Steel(steel_api_key=steel_api_key)
+        session = steel_client.sessions.create()
         try:
-            page = await ctx.new_page()
-
-            # 1. Open the parent tweet
-            await page.goto(tweet_url, wait_until="domcontentloaded", timeout=30000)
-            if "/flow/login" in page.url or page.url.endswith("/login"):
-                raise RuntimeError(
-                    f"X session expired (redirected to {page.url}). Re-run x-login."
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(
+                    f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
                 )
-
-            try:
-                await page.wait_for_selector(
-                    "article[data-testid='tweet']", timeout=20000
-                )
-            except PlaywrightTimeout:
-                raise RuntimeError(
-                    f"Parent tweet did not render at {tweet_url} (404/protected/deleted?)"
-                )
-
-            # 2. Click reply on the FIRST article (the parent, not a thread reply)
-            first_article = page.locator("article[data-testid='tweet']").first
-            reply_btn = first_article.locator("button[data-testid='reply']")
-            try:
-                await reply_btn.wait_for(state="visible", timeout=10000)
-                await reply_btn.click()
-            except PlaywrightTimeout:
-                raise RuntimeError(
-                    "Reply button not found on parent tweet — selector may have changed."
-                )
-
-            # 3. Focus composer (contenteditable) and type the text
-            # Try both standard and DraftJS/Lexical composer selectors
-            composer = None
-            for sel in ["[data-testid='tweetTextarea_0']", "[data-testid='tweetTextarea_0RichTextInputContainer']", "[role='textbox']"]:
+                ctx = await _new_logged_in_context_from_browser(browser, cookies)
                 try:
-                    c = page.locator(sel).first
-                    await c.wait_for(state="visible", timeout=5000)
-                    composer = c
-                    break
-                except PlaywrightTimeout:
-                    continue
-            if composer is None:
-                await page.screenshot(path="/tmp/x-post-debug-composer.png", full_page=False)
-                raise RuntimeError("Reply composer didn't open. Screenshot saved to /tmp/x-post-debug-composer.png")
-            await composer.click()
+                    page = await ctx.new_page()
 
-            # contenteditable needs keyboard.type, not fill
-            await page.keyboard.type(text, delay=15)
+                    # 1. Open the parent tweet
+                    await page.goto(tweet_url, wait_until="domcontentloaded", timeout=30000)
+                    if "/flow/login" in page.url or page.url.endswith("/login"):
+                        raise RuntimeError(
+                            f"X session expired (redirected to {page.url}). Re-run x-login."
+                        )
 
-            # 4. Submit — try both modal and inline submit button selectors
-            # X uses 'tweetButton' in modal replies and 'tweetButtonInline' in inline replies
-            submit_btn = None
-            for selector in [
-                "button[data-testid='tweetButton']",
-                "button[data-testid='tweetButtonInline']",
-            ]:
-                try:
-                    btn = page.locator(selector)
-                    await btn.wait_for(state="visible", timeout=5000)
-                    submit_btn = btn
-                    break
-                except PlaywrightTimeout:
-                    continue
-            if submit_btn is None:
-                # Take a debug screenshot before raising
-                await page.screenshot(path="/tmp/x-post-debug-submit.png", full_page=False)
-                raise RuntimeError(
-                    "Tweet submit button never appeared. "
-                    "Screenshot saved to /tmp/x-post-debug-submit.png"
-                )
+                    try:
+                        await page.wait_for_selector(
+                            "article[data-testid='tweet']", timeout=20000
+                        )
+                    except PlaywrightTimeout:
+                        raise RuntimeError(
+                            f"Parent tweet did not render at {tweet_url} (404/protected/deleted?)"
+                        )
 
-            # 5. Capture CreateTweet network response while clicking
-            rest_id = await _grab_create_tweet_id(page, lambda: submit_btn.click())
+                    # 2. Click reply on the FIRST article (the parent, not a thread reply)
+                    first_article = page.locator("article[data-testid='tweet']").first
+                    reply_btn = first_article.locator("button[data-testid='reply']")
+                    try:
+                        await reply_btn.wait_for(state="visible", timeout=10000)
+                        await reply_btn.click()
+                    except PlaywrightTimeout:
+                        raise RuntimeError(
+                            "Reply button not found on parent tweet — selector may have changed."
+                        )
 
-            # If we missed the network capture, give X a moment to process then fall back
-            if not rest_id:
-                await asyncio.sleep(3.0)
-                rest_id = await _fallback_latest_status(page, our_username)
+                    # 3. Focus composer (contenteditable) and type the text
+                    # Try both standard and DraftJS/Lexical composer selectors
+                    composer = None
+                    for sel in ["[data-testid='tweetTextarea_0']", "[data-testid='tweetTextarea_0RichTextInputContainer']", "[role='textbox']"]:
+                        try:
+                            c = page.locator(sel).first
+                            await c.wait_for(state="visible", timeout=5000)
+                            composer = c
+                            break
+                        except PlaywrightTimeout:
+                            continue
+                    if composer is None:
+                        await page.screenshot(path="/tmp/x-post-debug-composer.png", full_page=False)
+                        raise RuntimeError("Reply composer didn't open. Screenshot saved to /tmp/x-post-debug-composer.png")
+                    await composer.click()
 
-            if not rest_id:
-                raise RuntimeError(
-                    "Tweet submitted but could not resolve the new tweet id."
-                )
+                    # contenteditable needs keyboard.type, not fill
+                    await page.keyboard.type(text, delay=15)
 
-            reply_url = f"https://x.com/{our_username}/status/{rest_id}"
-            return {"reply_platform_id": rest_id, "reply_url": reply_url}
+                    # 4. Submit — try both modal and inline submit button selectors
+                    # X uses 'tweetButton' in modal replies and 'tweetButtonInline' in inline replies
+                    submit_btn = None
+                    for selector in [
+                        "button[data-testid='tweetButton']",
+                        "button[data-testid='tweetButtonInline']",
+                    ]:
+                        try:
+                            btn = page.locator(selector)
+                            await btn.wait_for(state="visible", timeout=5000)
+                            submit_btn = btn
+                            break
+                        except PlaywrightTimeout:
+                            continue
+                    if submit_btn is None:
+                        # Take a debug screenshot before raising
+                        await page.screenshot(path="/tmp/x-post-debug-submit.png", full_page=False)
+                        raise RuntimeError(
+                            "Tweet submit button never appeared. "
+                            "Screenshot saved to /tmp/x-post-debug-submit.png"
+                        )
+
+                    # 5. Capture CreateTweet network response while clicking
+                    rest_id = await _grab_create_tweet_id(page, lambda: submit_btn.click())
+
+                    # If we missed the network capture, give X a moment to process then fall back
+                    if not rest_id:
+                        await asyncio.sleep(3.0)
+                        rest_id = await _fallback_latest_status(page, our_username)
+
+                    if not rest_id:
+                        raise RuntimeError(
+                            "Tweet submitted but could not resolve the new tweet id."
+                        )
+
+                    reply_url = f"https://x.com/{our_username}/status/{rest_id}"
+                    return {"reply_platform_id": rest_id, "reply_url": reply_url}
+                finally:
+                    await ctx.close()
         finally:
-            await ctx.close()
-            await browser.close()
+            steel_client.sessions.release(session.id)
+    else:
+        async with async_playwright() as pw:
+            browser, ctx = await _new_logged_in_context(pw, cookies)
+            try:
+                page = await ctx.new_page()
+
+                # 1. Open the parent tweet
+                await page.goto(tweet_url, wait_until="domcontentloaded", timeout=30000)
+                if "/flow/login" in page.url or page.url.endswith("/login"):
+                    raise RuntimeError(
+                        f"X session expired (redirected to {page.url}). Re-run x-login."
+                    )
+
+                try:
+                    await page.wait_for_selector(
+                        "article[data-testid='tweet']", timeout=20000
+                    )
+                except PlaywrightTimeout:
+                    raise RuntimeError(
+                        f"Parent tweet did not render at {tweet_url} (404/protected/deleted?)"
+                    )
+
+                # 2. Click reply on the FIRST article (the parent, not a thread reply)
+                first_article = page.locator("article[data-testid='tweet']").first
+                reply_btn = first_article.locator("button[data-testid='reply']")
+                try:
+                    await reply_btn.wait_for(state="visible", timeout=10000)
+                    await reply_btn.click()
+                except PlaywrightTimeout:
+                    raise RuntimeError(
+                        "Reply button not found on parent tweet — selector may have changed."
+                    )
+
+                # 3. Focus composer (contenteditable) and type the text
+                # Try both standard and DraftJS/Lexical composer selectors
+                composer = None
+                for sel in ["[data-testid='tweetTextarea_0']", "[data-testid='tweetTextarea_0RichTextInputContainer']", "[role='textbox']"]:
+                    try:
+                        c = page.locator(sel).first
+                        await c.wait_for(state="visible", timeout=5000)
+                        composer = c
+                        break
+                    except PlaywrightTimeout:
+                        continue
+                if composer is None:
+                    await page.screenshot(path="/tmp/x-post-debug-composer.png", full_page=False)
+                    raise RuntimeError("Reply composer didn't open. Screenshot saved to /tmp/x-post-debug-composer.png")
+                await composer.click()
+
+                # contenteditable needs keyboard.type, not fill
+                await page.keyboard.type(text, delay=15)
+
+                # 4. Submit — try both modal and inline submit button selectors
+                # X uses 'tweetButton' in modal replies and 'tweetButtonInline' in inline replies
+                submit_btn = None
+                for selector in [
+                    "button[data-testid='tweetButton']",
+                    "button[data-testid='tweetButtonInline']",
+                ]:
+                    try:
+                        btn = page.locator(selector)
+                        await btn.wait_for(state="visible", timeout=5000)
+                        submit_btn = btn
+                        break
+                    except PlaywrightTimeout:
+                        continue
+                if submit_btn is None:
+                    # Take a debug screenshot before raising
+                    await page.screenshot(path="/tmp/x-post-debug-submit.png", full_page=False)
+                    raise RuntimeError(
+                        "Tweet submit button never appeared. "
+                        "Screenshot saved to /tmp/x-post-debug-submit.png"
+                    )
+
+                # 5. Capture CreateTweet network response while clicking
+                rest_id = await _grab_create_tweet_id(page, lambda: submit_btn.click())
+
+                # If we missed the network capture, give X a moment to process then fall back
+                if not rest_id:
+                    await asyncio.sleep(3.0)
+                    rest_id = await _fallback_latest_status(page, our_username)
+
+                if not rest_id:
+                    raise RuntimeError(
+                        "Tweet submitted but could not resolve the new tweet id."
+                    )
+
+                reply_url = f"https://x.com/{our_username}/status/{rest_id}"
+                return {"reply_platform_id": rest_id, "reply_url": reply_url}
+            finally:
+                await ctx.close()
+                await browser.close()

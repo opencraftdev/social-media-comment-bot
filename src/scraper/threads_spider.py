@@ -1,28 +1,31 @@
-"""Threads scraper using Playwright. Searches viral posts by keyword.
+"""Threads scraper using Playwright + Steel remote browser.
 
-Public search page: https://www.threads.net/search?q=<KEYWORD>&serp_type=default
+Firecrawl does not support threads.net, so we use Steel (cloud CDP) with the
+same Playwright-based scraping logic. Falls back to local Playwright if
+STEEL_API_KEY is not set (for local dev without Steel credentials).
 
 Strategy:
-  - Headless Chromium with realistic UA
-  - Visit search URL per keyword
-  - Wait for hydrated post cards
-  - Extract: post URL, text, author handle, engagement counts (best-effort)
-  - Return ScrapedPost list — caller writes to DB
+  1. Per keyword: open Threads search page (logged-in), collect post permalinks
+  2. Hydrate each post in the same browser session: open post page, extract
+     text + engagement from rendered DOM
+  3. Apply brand filters and return keepers
 
-Limits / known issues:
-  - Threads sometimes shows a login wall; we detect and skip in that case
-  - Anti-topics filter is applied client-side
-  - Engagement counts are not always visible on the search SERP — we record what we can
+Env vars:
+  STEEL_API_KEY — optional; if unset, local Playwright is used instead
 """
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import random
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from urllib.parse import quote_plus
 
+import steel as steel_sdk
 from playwright.async_api import (
     async_playwright,
     Browser,
@@ -33,10 +36,16 @@ from playwright.async_api import (
 
 from src.scraper.filters import passes_brand_filters
 
+
+ACCOUNTS_DIR = Path(__file__).resolve().parents[2] / "accounts"
+
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
+
+# Steel session lifetime in ms — 15 minutes to cover all keywords + hydration.
+_STEEL_SESSION_TIMEOUT_MS = 900_000
 
 
 @dataclass
@@ -54,10 +63,13 @@ class ScrapedPost:
 
 
 _REL_TIME_RE = re.compile(r"(\d+)\s*([smhdwy])", re.I)
+_BARE_NUM_RE = re.compile(r"^[\d]+(?:[.,]\d+)?\s*[KMkm]?$")
+_TIME_LINE_RE = re.compile(
+    r"^(?:\d+\s*[smhdy]|\d{1,2}/\d{1,2}/\d{2,4}|just now|edited|translate)$", re.I
+)
 
 
 def _parse_relative_time(s: str) -> datetime | None:
-    """Parse '2h', '15m', '3d' into a UTC datetime relative to now."""
     if not s:
         return None
     m = _REL_TIME_RE.search(s)
@@ -73,8 +85,6 @@ def _parse_relative_time(s: str) -> datetime | None:
     return datetime.now(timezone.utc) - timedelta(seconds=n * seconds)
 
 
-# ---------- URL/ID utilities ---------- #
-
 _THREADS_URL_RE = re.compile(
     r"^https?://(?:www\.)?threads\.(?:net|com)/@([\w.]+)/post/([\w-]+)"
 )
@@ -85,7 +95,6 @@ _SHORTCODE_ALPHABET = (
 
 
 def shortcode_to_id(shortcode: str) -> str:
-    """Decode Threads/Instagram base64 shortcode → numeric post id."""
     post_id = 0
     for ch in shortcode:
         post_id = post_id * 64 + _SHORTCODE_ALPHABET.index(ch)
@@ -109,8 +118,6 @@ def parse_threads_url(url: str) -> dict | None:
     }
 
 
-# ---------- Engagement parsing ---------- #
-
 _COUNT_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*([KMkm]?)")
 
 
@@ -129,23 +136,45 @@ def _parse_count(text: str | None) -> int:
     return int(num)
 
 
-# ---------- Core scraper ---------- #
+def _to_playwright_cookies(flat: dict[str, str]) -> list[dict]:
+    """Mirror cookies across threads.net / instagram.com / threads.com."""
+    out: list[dict] = []
+    for name, value in flat.items():
+        for domain in (".threads.net", ".instagram.com", ".threads.com"):
+            out.append({
+                "name": name,
+                "value": value,
+                "domain": domain,
+                "path": "/",
+                "secure": True,
+                "httpOnly": name in {"sessionid", "csrftoken"},
+                "sameSite": "Lax",
+            })
+    return out
 
-async def _setup_context(browser: Browser) -> BrowserContext:
-    return await browser.new_context(
+
+def _load_threads_cookies(username: str) -> dict | None:
+    path = ACCOUNTS_DIR / f"threads_{username}.cookies.json"
+    if not path.exists():
+        return None
+    with path.open() as f:
+        return json.load(f)
+
+
+async def _make_context(browser: Browser, cookies: dict | None) -> BrowserContext:
+    ctx = await browser.new_context(
         user_agent=USER_AGENT,
         viewport={"width": 1280, "height": 900},
         locale="en-US",
         device_scale_factor=2,
     )
-
-
-_BARE_NUM_RE = re.compile(r"^[\d]+(?:[.,]\d+)?\s*[KMkm]?$")
-_TIME_LINE_RE = re.compile(r"^(?:\d+\s*[smhdy]|\d{1,2}/\d{1,2}/\d{2,4}|just now|edited|translate)$", re.I)
+    if cookies:
+        await ctx.add_cookies(_to_playwright_cookies(cookies))
+    return ctx
 
 
 async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
-    """Open the post page in Playwright, extract text + engagement from rendered DOM."""
+    """Open the post page and extract text + engagement from rendered DOM."""
     page = await ctx.new_page()
     try:
         await page.goto(post.parent_post_url, wait_until="domcontentloaded", timeout=20000)
@@ -154,14 +183,12 @@ async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
         except PlaywrightTimeout:
             return
 
-        # Pull full innerText + scan for relative timestamps via aria-labels
         try:
             data = await page.evaluate(
                 """() => {
                     const root = document.querySelector('article')
                               || document.querySelector('[data-pressable-container]');
                     if (!root) return null;
-                    // Look for time element with datetime attr first (most reliable)
                     const t = root.querySelector('time');
                     return {
                         text: (root.innerText || '').slice(0, 3000),
@@ -180,7 +207,6 @@ async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
         if not text_blob:
             return
 
-        # Parse timestamp
         iso = (data.get("time_iso") or "").strip()
         if iso:
             try:
@@ -204,7 +230,6 @@ async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
             if _BARE_NUM_RE.match(ln):
                 trailing_nums.append(ln)
                 continue
-            # If we already collected numbers, we're past the body — stop
             if trailing_nums:
                 break
             body_lines.append(ln)
@@ -213,7 +238,6 @@ async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
         if body:
             post.parent_post_text = body
 
-        # Threads engagement order in DOM: likes, replies, reposts, quotes/views
         if len(trailing_nums) >= 1:
             post.parent_likes = _parse_count(trailing_nums[0])
         if len(trailing_nums) >= 2:
@@ -226,9 +250,7 @@ async def _hydrate_post(ctx: BrowserContext, post: ScrapedPost) -> None:
         await page.close()
 
 
-async def _scrape_one_keyword(
-    page: Page, keyword: str, limit: int
-) -> list[ScrapedPost]:
+async def _scrape_one_keyword(page: Page, keyword: str, limit: int) -> list[ScrapedPost]:
     """Scrape Threads search results for a single keyword."""
     url = f"https://www.threads.net/search?q={quote_plus(keyword)}&serp_type=default&filter=top"
     posts: list[ScrapedPost] = []
@@ -239,23 +261,20 @@ async def _scrape_one_keyword(
         print(f"  [!] timeout loading search for '{keyword}'")
         return posts
 
-    # Threads can show a login wall — detect quickly and skip
     try:
         await page.wait_for_selector("a[href*='/@'][href*='/post/']", timeout=12000)
     except PlaywrightTimeout:
         body_text = (await page.content())[:600].lower()
         if "log in" in body_text or "sign up" in body_text:
-            print(f"  [!] login wall for '{keyword}' — skipping (consider auth)")
+            print(f"  [!] login wall for '{keyword}' — cookies may be expired")
         else:
             print(f"  [!] no post links rendered for '{keyword}'")
         return posts
 
-    # Smooth scroll a few times to load more cards
     for _ in range(3):
         await page.mouse.wheel(0, 1800)
         await asyncio.sleep(random.uniform(0.8, 1.6))
 
-    # Collect distinct post permalinks
     hrefs = await page.evaluate(
         """() => Array.from(document.querySelectorAll("a[href*='/post/']"))
                 .map(a => a.href)
@@ -270,13 +289,11 @@ async def _scrape_one_keyword(
             seen.add(clean)
             permalinks.append(clean)
 
-    # For each permalink, find its DOM card and pull text + engagement
-    for permalink in permalinks[: limit]:
+    for permalink in permalinks[:limit]:
         parsed = parse_threads_url(permalink)
         if not parsed:
             continue
 
-        # Locate nearest article element containing this link
         try:
             card_data = await page.evaluate(
                 """(href) => {
@@ -289,7 +306,6 @@ async def _scrape_one_keyword(
                     const root = el || anchor.closest('div');
                     if (!root) return null;
                     const text = root.innerText || '';
-                    // engagement labels: like "12 replies", "340 likes"
                     const m = text.match(/([\\d,.]+\\s*[KMkm]?)\\s*likes?/i);
                     const r = text.match(/([\\d,.]+\\s*[KMkm]?)\\s*repl(?:y|ies)/i);
                     return {
@@ -328,23 +344,24 @@ async def _scrape_one_keyword(
     return posts
 
 
-async def scrape_threads_viral(brand: dict, limit: int = 30) -> list[ScrapedPost]:
-    """Run scraping across all brand keywords. Returns aggregated, deduped posts.
-
-    Caller is responsible for inserting into DB.
-    """
+async def _run_with_browser(
+    browser: Browser, brand: dict, limit: int, cookies: dict | None
+) -> list[ScrapedPost]:
+    """Core scraping logic: search phase then hydration phase, same browser session."""
     keywords = brand["viral_post_filters"]["monitor_keywords"]
-    anti_topics = [t.lower() for t in brand["niche"]["anti_topics"]]
-    per_kw_limit = max(3, limit // max(1, len(keywords)))
+    # Collect 3x the final limit so language/engagement filtering has a full pool to work with.
+    raw_target = max(limit * 3, 15)
+    per_kw_limit = max(3, raw_target // max(1, len(keywords)))
 
     all_posts: list[ScrapedPost] = []
     seen_ids: set[str] = set()
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
-        ctx = await _setup_context(browser)
-        page = await ctx.new_page()
+    # Single context with cookies for both phases
+    ctx = await _make_context(browser, cookies)
 
+    try:
+        # Phase 1: collect post permalinks via search pages
+        page = await ctx.new_page()
         try:
             for kw in keywords:
                 print(f"  · keyword: {kw}")
@@ -356,34 +373,61 @@ async def scrape_threads_viral(brand: dict, limit: int = 30) -> list[ScrapedPost
                     seen_ids.add(p.parent_post_id)
                     all_posts.append(p)
 
-                # polite delay between keywords
                 await asyncio.sleep(random.uniform(2.0, 4.0))
 
-                if len(all_posts) >= limit:
+                if len(all_posts) >= raw_target:
                     break
         finally:
-            await ctx.close()
-            await browser.close()
+            await page.close()
 
-    # Hydrate text + engagement by rendering each post page in Playwright
-    if all_posts:
-        print(f"  · hydrating {len(all_posts)} posts in browser…")
+        # Phase 2: hydrate each post page (text + timestamps) — same context, 2 tabs
+        if all_posts:
+            print(f"  · hydrating {len(all_posts)} posts…")
+            sem = asyncio.Semaphore(2)
+
+            async def _bound(p: ScrapedPost) -> None:
+                async with sem:
+                    await _hydrate_post(ctx, p)
+
+            await asyncio.gather(*(_bound(p) for p in all_posts))
+
+    finally:
+        await ctx.close()
+
+    return all_posts
+
+
+async def scrape_threads_viral(brand: dict, limit: int = 30) -> list[ScrapedPost]:
+    """Scrape Threads for viral posts matching brand keywords.
+
+    Uses Steel remote browser if STEEL_API_KEY is set, otherwise falls back
+    to local Playwright (for dev without Steel credentials).
+    """
+    steel_api_key = os.environ.get("STEEL_API_KEY")
+    username = brand["accounts"]["threads"]["username"]
+    cookies = _load_threads_cookies(username)
+    if not cookies:
+        print("  [!] No Threads cookies found — scraping without auth (may hit login wall)")
+
+    if steel_api_key:
+        steel_client = steel_sdk.Steel(steel_api_key=steel_api_key)
+        session = steel_client.sessions.create(timeout=_STEEL_SESSION_TIMEOUT_MS)
+        try:
+            async with async_playwright() as pw:
+                browser = await pw.chromium.connect_over_cdp(
+                    f"wss://connect.steel.dev?apiKey={steel_api_key}&sessionId={session.id}"
+                )
+                all_posts = await _run_with_browser(browser, brand, limit, cookies)
+                await browser.close()
+        finally:
+            steel_client.sessions.release(session.id)
+    else:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
-            ctx = await _setup_context(browser)
-            try:
-                sem = asyncio.Semaphore(2)  # 2 tabs in parallel
+            all_posts = await _run_with_browser(browser, brand, limit, cookies)
+            await browser.close()
 
-                async def _bound_hydrate(p: ScrapedPost) -> None:
-                    async with sem:
-                        await _hydrate_post(ctx, p)
-
-                await asyncio.gather(*(_bound_hydrate(p) for p in all_posts))
-            finally:
-                await ctx.close()
-                await browser.close()
-
-    # Apply full brand filters (self-skip, anti-topics, spam, engagement, age)
+    # Apply brand filters
     kept: list[ScrapedPost] = []
     drop_counts: dict[str, int] = {}
     for p in all_posts:
@@ -405,4 +449,5 @@ async def scrape_threads_viral(brand: dict, limit: int = 30) -> list[ScrapedPost
         summary = ", ".join(f"{k}={v}" for k, v in sorted(drop_counts.items()))
         print(f"  · filter drops: {summary}")
 
+    print(f"  → kept {len(kept)} after filters")
     return kept[:limit]

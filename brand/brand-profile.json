@@ -183,10 +183,10 @@
       "#StartupIndonesia"
     ],
     "min_engagement": {
-      "x": { "min_likes": 5, "min_replies": 0 },
-      "threads": { "min_likes": 5, "engagement_proxy": "has_replies=true" }
+      "x": { "min_likes": 2, "min_replies": 0 },
+      "threads": { "min_likes": 2, "engagement_proxy": "has_replies=true" }
     },
-    "max_post_age_hours": 48,
+    "max_post_age_hours": 96,
     "language_preference": ["id"],
     "language_priority_note": "Indonesian only — X scraper searches lang:id only. Threads posts are filtered post-hydration. English-language posts are dropped at confidence ≥ 0.6.",
     "skip_if_post_contains": [

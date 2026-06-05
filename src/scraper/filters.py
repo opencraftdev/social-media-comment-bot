@@ -177,12 +177,12 @@ def passes_brand_filters(
         if age > timedelta(hours=int(max_hours)):
             return False, f"age>{max_hours}h"
 
-    # 6. language
+    # 6. language — drop any post whose language is definitively not Indonesian.
+    # Keep 'und' (undetectable) since short Indo+English tech posts often fall there.
     lang_pref = vpf.get("language_preference") or []
     if lang_pref:
         lang, conf = detect_language(text)
-        # Be lenient: allow if detected lang is in preference OR low confidence
-        if lang not in lang_pref and conf >= 0.6:
+        if lang not in lang_pref and lang != "und":
             return False, f"lang:{lang}"
 
     return True, None
